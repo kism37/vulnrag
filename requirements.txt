@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+sentence-transformers
+qdrant-client
+ollama
+urllib3
