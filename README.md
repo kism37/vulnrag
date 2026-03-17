@@ -1,4 +1,4 @@
-# vulnrag
+# ragent
 
 An AI-powered recon and attack surface analysis tool built on a RAG pipeline. Point it at a target, it fingerprints the stack, hunts for secrets in JS files, flags vulnerable libraries, maps the attack surface, then uses a local LLM to suggest attack paths based on a continuously updated knowledge base of real bug bounty reports and CVEs.
 
