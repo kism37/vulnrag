@@ -25,29 +25,28 @@ class Action:
     risk: str = ""              # what could go wrong
 
 
-_auto_approve_all = False
-_session_approved = set()
+_auto_approve_all    = False
+_auto_approve_active = False
+_session_approved    = set()
 
 
 def set_auto_approve(val: bool):
-    """For testing only — skips all prompts."""
     global _auto_approve_all
     _auto_approve_all = val
 
 
+def set_auto_approve_active(val: bool):
+    global _auto_approve_active
+    _auto_approve_active = val
+
+
 def request(action: Action) -> bool:
-    """
-    Request permission to execute an action.
-    Returns True if approved, False if skipped.
-    Passive actions are always approved silently.
-    """
     if action.action_type == ActionType.PASSIVE:
         return True
-
     if _auto_approve_all:
         return True
-
-    # Check if user already approved this action type this session
+    if _auto_approve_active and action.action_type == ActionType.ACTIVE:
+        return True
     if action.name in _session_approved:
         return True
 

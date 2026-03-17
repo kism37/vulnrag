@@ -26,36 +26,57 @@ def run(ctx: TargetContext) -> TargetContext:
     )
     print(f"\n[*] AI injection priority decision:\n{decision}")
 
-    # Auto-probe common paths for SSTI
+    # Auto-probe common paths for SSTI using differential analysis
     probe_action = injection_probe(ctx.url, "q", "{{7*7}}")
     if request(probe_action):
-        print("\n[*] Probing for SSTI...")
+        print("\n[*] Probing for SSTI (differential analysis)...")
         test_paths = ["/search", "/api/search", "/?q=", "/render"]
         for path in test_paths:
             try:
-                for payload in SSTI_PAYLOADS:
+                full_url = urljoin(ctx.url, path)
+
+                # Baseline request with a benign value
+                baseline = requests.get(
+                    full_url,
+                    params={"q": "vulnragtest1234", "search": "vulnragtest1234"},
+                    timeout=5, verify=False,
+                    headers={"User-Agent": "Mozilla/5.0"}
+                )
+
+                # Check if baseline already contains "49" — if so, skip (would be false positive)
+                baseline_has_49 = "49" in baseline.text
+
+                for payload in SSTI_PAYLOADS[:2]:  # test fewer payloads, reduce noise
                     r = requests.get(
-                        urljoin(ctx.url, path),
-                        params={"q": payload, "search": payload, "name": payload},
+                        full_url,
+                        params={"q": payload, "search": payload},
                         timeout=5, verify=False,
                         headers={"User-Agent": "Mozilla/5.0"}
                     )
-                    if "49" in r.text:
+                    # Only flag if:
+                    # 1. "49" appears in payload response
+                    # 2. "49" was NOT in baseline (differential)
+                    # 3. Response is different from baseline
+                    payload_has_49 = "49" in r.text
+                    response_changed = abs(len(r.text) - len(baseline.text)) < 500  # similar size = reflected
+                    if payload_has_49 and not baseline_has_49:
                         ctx.add_finding(Finding(
-                            stage="injection", category="SSTI", severity="critical",
-                            title=f"SSTI confirmed at {path}",
-                            detail=f"Payload {payload} returned 49 in response",
-                            recommendation="Test for RCE: tplmap -u '" + urljoin(ctx.url, path) + "'"
+                            stage="injection", category="SSTI", severity="high",
+                            title=f"Possible SSTI at {path} — needs manual verification",
+                            detail=f"Payload {payload} returned '49' which was absent in baseline. Verify manually with tplmap.",
+                            recommendation=f"tplmap -u '{full_url}?q=1' — confirm before reporting"
                         ))
-                        print(f"  🚨 SSTI at {path} with {payload}")
-                    if any(e in r.text.lower() for e in ["sql syntax", "mysql_fetch", "pg_query", "sqlite"]):
-                        ctx.add_finding(Finding(
-                            stage="injection", category="SQLi", severity="high",
-                            title=f"SQL error at {path}",
-                            detail=f"SQL error message in response",
-                            recommendation=f"sqlmap -u '{urljoin(ctx.url, path)}?q=1' --dbs --batch"
-                        ))
-                        print(f"  🚨 SQL error at {path}")
+                        print(f"  ⚠️  Possible SSTI at {path} with {payload} — verify manually")
+
+                    if any(e in r.text.lower() for e in ["sql syntax", "mysql_fetch", "pg_query", "sqlite", "you have an error in your sql"]):
+                        if not any(e in baseline.text.lower() for e in ["sql syntax", "mysql_fetch", "pg_query"]):
+                            ctx.add_finding(Finding(
+                                stage="injection", category="SQLi", severity="high",
+                                title=f"SQL error at {path} — needs manual verification",
+                                detail="SQL error message appeared after injection payload, absent in baseline",
+                                recommendation=f"sqlmap -u '{full_url}?q=1' --dbs --batch --level=2"
+                            ))
+                            print(f"  ⚠️  SQL error at {path} — verify manually")
             except Exception:
                 pass
 

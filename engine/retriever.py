@@ -15,10 +15,15 @@ from engine.embedder import embed, embed_document, VECTOR_SIZE
 COLLECTION_NAME = "vulnrag_knowledge"
 VECTORSTORE_PATH = "knowledge/vectorstore"
 
+_client = None
+
 
 def get_client() -> QdrantClient:
-    os.makedirs(VECTORSTORE_PATH, exist_ok=True)
-    return QdrantClient(path=VECTORSTORE_PATH)
+    global _client
+    if _client is None:
+        os.makedirs(VECTORSTORE_PATH, exist_ok=True)
+        _client = QdrantClient(path=VECTORSTORE_PATH)
+    return _client
 
 
 def ensure_collection(client: QdrantClient):

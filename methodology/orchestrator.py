@@ -57,7 +57,22 @@ def run(url: str, skip: list[str] = None) -> str:
         print(f"    {num}. {name}{status}")
 
     print(f"\n  Knowledge base will inform all recommendations.")
-    print(f"  Active actions require your approval before executing.")
+    print(f"\n  Approval mode:")
+    print(f"  [1] Ask before every active action")
+    print(f"  [2] Auto-approve scans, ask only before sending payloads")
+    print(f"  [3] Auto-approve everything (no prompts)")
+    mode = input("\n  Choose [1/2/3] (default 2): ").strip() or "2"
+    if mode == "3":
+        from methodology import human_gate
+        human_gate.set_auto_approve(True)
+        print("  Auto-approving all actions.")
+    elif mode == "2":
+        from methodology import human_gate
+        human_gate.set_auto_approve_active(True)
+        print("  Auto-approving scans. Will ask before sending payloads.")
+    else:
+        print("  Will ask before every active action.")
+
     print(f"\n  Starting in 3 seconds... (Ctrl+C to abort a stage)\n")
     time.sleep(3)
 

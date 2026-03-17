@@ -1,17 +1,80 @@
 """
 methodology/stages/s02_active_recon.py
 Stage 2: Active recon — fingerprinting, subdomain enum, port scanning.
-All active actions go through the human gate.
+Subdomains are followed through — each interesting one gets its own recon pass.
 """
 
 import requests
+import subprocess
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 from methodology.context import TargetContext, Finding
 from methodology.human_gate import request, subdomain_enum, port_scan, js_fetch, ActionType, Action
 from engine import recon as R
 from engine.llm import ask_with_rag
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) vulnrag/2.0"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ragent/1.0"}
+
+INTERESTING_SUBDOMAIN_KEYWORDS = [
+    "api", "admin", "portal", "dev", "staging", "test", "beta",
+    "app", "dashboard", "internal", "staff", "login", "auth",
+    "registry", "pay", "billing", "mail", "vpn", "remote",
+]
+
+
+def _is_interesting_subdomain(sub: str) -> bool:
+    return any(k in sub.lower() for k in INTERESTING_SUBDOMAIN_KEYWORDS)
+
+
+def _quick_recon_subdomain(sub: str, ctx: TargetContext):
+    """Run quick recon on a single subdomain."""
+    for scheme in ["https", "http"]:
+        url = f"{scheme}://{sub}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8, verify=False)
+            print(f"\n  🔹 {sub} — {r.status_code}")
+
+            headers = {k.lower(): v for k, v in r.headers.items()}
+
+            for h in ["server", "x-powered-by", "x-generator"]:
+                if h in headers:
+                    print(f"     🖥️  {h}: {headers[h]}")
+                    if headers[h] not in ctx.tech_stack:
+                        ctx.tech_stack.append(f"{sub} — {h}: {headers[h]}")
+
+            acao = headers.get("access-control-allow-origin", "")
+            if acao == "*":
+                print(f"     🚨 CORS wildcard on {sub}")
+                ctx.add_finding(Finding(
+                    stage="active_recon", category="Misconfiguration", severity="high",
+                    title=f"CORS wildcard on subdomain: {sub}",
+                    detail=f"Access-Control-Allow-Origin: * on {url}",
+                    recommendation="Restrict CORS to specific trusted origins"
+                ))
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            js_files = R.find_js_files(url, soup)
+            if js_files:
+                js_data = R.analyze_js(js_files[:5])
+                for secret in js_data.get("secrets", []):
+                    print(f"     🚨 Secret in JS: {secret['type']} = {secret['value'][:50]}")
+                    ctx.add_finding(Finding(
+                        stage="active_recon", category="Secret Exposure", severity="high",
+                        title=f"Secret in JS on {sub}: {secret['type']}",
+                        detail=f"{secret['value'][:80]}",
+                        recommendation="Rotate credential immediately"
+                    ))
+                for lib in js_data.get("vuln_libs", []):
+                    print(f"     ⚠️  Vulnerable lib: {lib['lib']} {lib['version']} — {lib['cve']}")
+
+            if r.status_code == 403:
+                print(f"     ⚠️  403 — try auth bypass headers")
+            elif r.status_code == 401:
+                print(f"     ⚠️  401 — test default creds")
+
+            break
+        except Exception:
+            continue
 
 
 def run(ctx: TargetContext) -> TargetContext:
@@ -19,13 +82,12 @@ def run(ctx: TargetContext) -> TargetContext:
     print("  STAGE 2 — Active Recon & Fingerprinting")
     print("="*60)
 
-    # Header analysis — single request, ask permission
     action = Action(
         name="fetch_target",
         description=f"Fetch {ctx.url} to analyze headers and page content",
         command=f"curl -I {ctx.url}",
         action_type=ActionType.ACTIVE,
-        risk="One HTTP request to target — will appear in access logs",
+        risk="One HTTP request to target",
     )
     if request(action):
         print(f"\n[*] Fetching {ctx.url}...")
@@ -46,8 +108,8 @@ def run(ctx: TargetContext) -> TargetContext:
                 print(f"  ⚠️  Missing headers: {', '.join(ctx.missing_headers)}")
                 ctx.add_finding(Finding(
                     stage="active_recon", category="Misconfiguration", severity="medium",
-                    title=f"Missing security headers: {', '.join(ctx.missing_headers[:3])}",
-                    detail=f"Headers absent: {', '.join(ctx.missing_headers)}",
+                    title="Missing security headers",
+                    detail=f"Absent: {', '.join(ctx.missing_headers)}",
                     recommendation="Add missing security headers to all responses"
                 ))
 
@@ -58,11 +120,9 @@ def run(ctx: TargetContext) -> TargetContext:
                         stage="active_recon", category="Misconfiguration", severity="high",
                         title="CORS wildcard misconfiguration",
                         detail=issue,
-                        recommendation="Restrict Access-Control-Allow-Origin to specific trusted origins"
+                        recommendation="Restrict Access-Control-Allow-Origin to specific origins"
                     ))
 
-            # JS analysis
-            from bs4 import BeautifulSoup
             soup = BeautifulSoup(resp.text, "html.parser")
             js_files = R.find_js_files(ctx.url, soup)
             print(f"\n[*] Found {len(js_files)} JS files")
@@ -70,7 +130,7 @@ def run(ctx: TargetContext) -> TargetContext:
             if js_files:
                 js_action = js_fetch(ctx.url, fn=None)
                 if request(js_action):
-                    print("[*] Analyzing JS files for secrets and vulnerable libraries...")
+                    print("[*] Analyzing JS files...")
                     js_data = R.analyze_js(js_files)
                     ctx.js_secrets = js_data["secrets"]
                     ctx.vuln_libs = js_data["vuln_libs"]
@@ -81,9 +141,8 @@ def run(ctx: TargetContext) -> TargetContext:
                             stage="active_recon", category="Secret Exposure", severity="high",
                             title=f"Potential secret in JS: {secret['type']}",
                             detail=f"Found in {secret['file']}: {secret['value'][:80]}",
-                            recommendation="Rotate the exposed credential immediately, move secrets server-side"
+                            recommendation="Rotate the exposed credential immediately"
                         ))
-
                     for lib in ctx.vuln_libs:
                         print(f"  🚨 {lib['lib']} {lib['version']} — {lib['cve']}: {lib['desc']}")
                         ctx.add_finding(Finding(
@@ -93,17 +152,22 @@ def run(ctx: TargetContext) -> TargetContext:
                             recommendation=f"Upgrade {lib['lib']} to latest version"
                         ))
 
-    # Subdomain enumeration
-    sub_action = subdomain_enum(ctx.domain, fn=lambda: R.enumerate_subdomains(ctx.domain))
-    approved, result = False, None
-    approved = request(sub_action)
-    if approved:
+    # Subdomain enum + follow-through
+    sub_action = subdomain_enum(ctx.domain)
+    if request(sub_action):
         print(f"\n[*] Running subfinder on {ctx.domain}...")
         subs = R.enumerate_subdomains(ctx.domain)
         ctx.subdomains = list(set(ctx.subdomains + subs))
-        print(f"  Found {len(subs)} subdomains via subfinder")
-        for s in subs[:15]:
-            print(f"  🔹 {s}")
+        print(f"  Found {len(subs)} subdomains")
+
+        interesting = [s for s in subs if _is_interesting_subdomain(s)]
+        boring = [s for s in subs if not _is_interesting_subdomain(s)]
+        print(f"  Interesting: {len(interesting)} | Other: {len(boring)}")
+
+        if interesting:
+            print(f"\n[*] Following through on {min(len(interesting), 10)} interesting subdomains...")
+            for sub in interesting[:10]:
+                _quick_recon_subdomain(sub, ctx)
 
     # Port scan
     scan_action = port_scan(ctx.domain, fn=lambda: R.scan_ports(ctx.domain))
@@ -121,14 +185,25 @@ def run(ctx: TargetContext) -> TargetContext:
                     recommendation="Restrict database access to internal network only"
                 ))
             if p["port"] == "21":
-                ctx.add_finding(Finding(
-                    stage="active_recon", category="Network", severity="medium",
-                    title="FTP exposed on port 21",
-                    detail="FTP is unencrypted — check for anonymous login",
-                    recommendation="Disable FTP, use SFTP instead. Test: ftp anonymous@target"
-                ))
+                print(f"  [*] Testing FTP anonymous login...")
+                try:
+                    import ftplib
+                    ftp = ftplib.FTP()
+                    ftp.connect(ctx.domain, 21, timeout=5)
+                    ftp.login("anonymous", "anonymous@test.com")
+                    files = ftp.nlst()
+                    ftp.quit()
+                    ctx.add_finding(Finding(
+                        stage="active_recon", category="Network", severity="critical",
+                        title="FTP anonymous login enabled",
+                        detail=f"Files visible: {', '.join(files[:5])}",
+                        recommendation="Disable anonymous FTP login immediately"
+                    ))
+                    print(f"  🚨 FTP anonymous login works! Files: {files[:5]}")
+                except Exception as e:
+                    print(f"  FTP anonymous login: {e}")
 
-    # LLM analysis with full recon context
+    # AI analysis
     print("\n[*] AI analysis of active recon...")
     analysis = ask_with_rag(
         query="What attack paths does this recon reveal? What should I prioritize?",
@@ -140,7 +215,7 @@ def run(ctx: TargetContext) -> TargetContext:
             "cors_issues": ctx.cors_issues,
             "js_secrets_found": len(ctx.js_secrets),
             "vuln_libs": [f"{l['lib']} {l['version']}" for l in ctx.vuln_libs],
-            "subdomains": ctx.subdomains[:5],
+            "interesting_subdomains": [s for s in ctx.subdomains if _is_interesting_subdomain(s)][:5],
         }
     )
     print(f"\n{analysis}")
