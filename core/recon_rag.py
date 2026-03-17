@@ -1,6 +1,7 @@
 import re
 import sys
 import json
+import subprocess
 import requests
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -8,12 +9,15 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 import ollama
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── Config ───────────────────────────────────────────────────────────────────
 COLLECTION_NAME = "bugbounty"
 EMBED_MODEL     = "all-MiniLM-L6-v2"
 LLM_MODEL       = "llama3.2"
-HEADERS         = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) recon-rag/1.0"}
+HEADERS         = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) vulnrag/2.0"}
 
 # ── Known vulnerable JS library versions ─────────────────────────────────────
 VULN_LIBS = {
@@ -42,28 +46,26 @@ VULN_LIBS = {
     ],
 }
 
-# ── Regex patterns for secret/endpoint hunting ────────────────────────────────
+# ── Secret patterns ───────────────────────────────────────────────────────────
 SECRET_PATTERNS = {
-    "AWS Access Key":       r"AKIA[0-9A-Z]{16}",
-    "AWS Secret Key":       r"(?i)aws.{0,20}secret.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]",
-    "Generic API Key":      r"(?i)(api[_\-]?key|apikey)\s*[:=]\s*['\"][a-zA-Z0-9\-_]{16,}['\"]",
-    "Bearer Token":         r"(?i)bearer\s+[a-zA-Z0-9\-_\.]{20,}",
-    "Private Key":          r"-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----",
-    "JWT Token":            r"eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+",
-    "Supabase Key":         r"(?i)supabase.{0,20}['\"][a-zA-Z0-9\-_\.]{30,}['\"]",
-    "Firebase URL":         r"https://[a-zA-Z0-9\-]+\.firebaseio\.com",
-    "S3 Bucket":            r"s3\.amazonaws\.com/[a-zA-Z0-9\-_\.]+",
-    "Internal URL":         r"https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)",
-    "Email Address":        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-    "GraphQL Endpoint":     r"(?i)['\"/](graphql|gql)['\"/]",
-    "API Endpoint":         r"(?i)['\"]/(api|v\d|rest|internal|admin|auth|oauth|token)[/a-zA-Z0-9\-_]*['\"]",
+    "AWS Access Key":    r"AKIA[0-9A-Z]{16}",
+    "Generic API Key":   r"(?i)(api[_\-]?key|apikey)\s*[:=]\s*['\"][a-zA-Z0-9\-_]{16,}['\"]",
+    "Bearer Token":      r"(?i)bearer\s+[a-zA-Z0-9\-_\.]{20,}",
+    "Private Key":       r"-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----",
+    "JWT Token":         r"eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+",
+    "Supabase Key":      r"(?i)supabase.{0,20}['\"][a-zA-Z0-9\-_\.]{30,}['\"]",
+    "Firebase URL":      r"https://[a-zA-Z0-9\-]+\.firebaseio\.com",
+    "S3 Bucket":         r"s3\.amazonaws\.com/[a-zA-Z0-9\-_\.]+",
+    "Internal URL":      r"https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)",
+    "GraphQL Endpoint":  r"(?i)['\"/](graphql|gql)['\"/]",
+    "API Endpoint":      r"(?i)['\"]/(api|v\d|rest|internal|admin|auth|oauth|token)[/a-zA-Z0-9\-_]*['\"]",
 }
 
 # ── Knowledge base ────────────────────────────────────────────────────────────
 WRITEUPS = [
     {
         "title": "Stored XSS via SVG upload",
-        "content": """Vuln class: Stored XSS. SVG file uploads without sanitization allow <script> injection.
+        "content": """Vuln class: Stored XSS. SVG file uploads without sanitization allow script injection.
         Steps: Upload SVG with embedded script, share link, victim executes JS.
         Impact: Session hijacking, credential theft, account takeover.
         Fix: Sanitize SVG server-side, use Content-Security-Policy.""",
@@ -101,7 +103,7 @@ WRITEUPS = [
     {
         "title": "Prototype Pollution via JavaScript library",
         "content": """Vuln class: Prototype Pollution. Vulnerable lodash/jQuery versions allow __proto__ manipulation.
-        Steps: Pass {\"__proto__\":{\"admin\":true}} to merge/extend functions.
+        Steps: Pass {"__proto__":{"admin":true}} to merge/extend functions.
         Impact: Privilege escalation, auth bypass, RCE in some Node.js contexts.
         Fix: Update libraries, validate merge inputs.""",
     },
@@ -123,93 +125,216 @@ WRITEUPS = [
         Steps: POST {__schema{types{name}}} to /graphql endpoint.
         Impact: Full API schema exposed, facilitates targeted attacks. Fix: Disable introspection in production.""",
     },
+    {
+        "title": "Subdomain Takeover",
+        "content": """Vuln class: Subdomain Takeover. DNS record points to deprovisioned cloud resource.
+        Steps: Enumerate subdomains, find CNAME pointing to unclaimed resource (S3, GitHub Pages, Heroku).
+        Claim the resource on the provider, serve malicious content.
+        Impact: Phishing, cookie theft, reputation damage. Fix: Remove dangling DNS records.""",
+    },
+    {
+        "title": "Open Ports Leading to Admin Panel Exposure",
+        "content": """Vuln class: Misconfiguration. Internal admin panels accessible on non-standard ports.
+        Steps: Scan target for open ports, find admin panel on port 8080/8443/9000.
+        Panel accessible without auth or with default credentials.
+        Impact: Full admin access, data exfil. Fix: Firewall internal services, require auth.""",
+    },
+    {
+        "title": "Sensitive Data in robots.txt and sitemap",
+        "content": """Vuln class: Information Disclosure. robots.txt reveals hidden endpoints.
+        Steps: Fetch /robots.txt and /sitemap.xml, note disallowed paths.
+        Visit those paths directly to find admin panels, staging environments, internal APIs.
+        Impact: Attack surface expansion. Fix: Don't list sensitive paths in robots.txt.""",
+    },
 ]
 
 
 # ── RAG setup ─────────────────────────────────────────────────────────────────
 def setup_rag():
-    print("🔧 Loading embedding model...")
+    print("[*] Loading embedding model...")
     embedder = SentenceTransformer(EMBED_MODEL)
-
-    print("🔧 Setting up vector DB...")
+    print("[*] Setting up vector DB...")
     client = QdrantClient(":memory:")
     client.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
-
-    print("📚 Indexing writeups...")
     points = []
     for i, w in enumerate(WRITEUPS):
         text = f"{w['title']}\n{w['content']}"
         vector = embedder.encode(text).tolist()
         points.append(PointStruct(id=i, vector=vector, payload=w))
     client.upsert(collection_name=COLLECTION_NAME, points=points)
-    print(f"✅ {len(points)} writeups indexed\n")
+    print(f"[+] {len(points)} writeups indexed\n")
     return embedder, client
 
 
-# ── Recon functions ───────────────────────────────────────────────────────────
-def fetch_page(url):
+# ── Module 1: Subdomain Enumeration ──────────────────────────────────────────
+def enumerate_subdomains(domain):
+    print(f"\n[*] Enumerating subdomains for {domain}...")
+    subdomains = []
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        return r
+        result = subprocess.run(
+            ["subfinder", "-d", domain, "-silent"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            subdomains = [s.strip() for s in result.stdout.strip().split("\n") if s.strip()]
+            print(f"[+] Found {len(subdomains)} subdomains")
+            for s in subdomains[:20]:  # show first 20
+                print(f"    {s}")
+            if len(subdomains) > 20:
+                print(f"    ... and {len(subdomains) - 20} more")
+        else:
+            print(f"[-] subfinder error: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        print("[-] subfinder timed out after 60s")
+    except FileNotFoundError:
+        print("[-] subfinder not found, skipping")
+    return subdomains
+
+
+# ── Module 2: Port Scanning ───────────────────────────────────────────────────
+def scan_ports(host, quick=True):
+    print(f"\n[*] Port scanning {host}...")
+    open_ports = []
+    try:
+        # Quick scan: top 1000 ports. Set quick=False for full range.
+        cmd = ["nmap", "-T4", "--open", "-oN", "-", host]
+        if quick:
+            cmd = ["nmap", "-T4", "--open", "--top-ports", "1000", "-sV", "-oN", "-", host]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if result.returncode == 0:
+            for line in result.stdout.split("\n"):
+                if "/tcp" in line and "open" in line:
+                    parts = line.split()
+                    port_proto = parts[0]
+                    service = parts[2] if len(parts) > 2 else "unknown"
+                    version = " ".join(parts[3:]) if len(parts) > 3 else ""
+                    entry = {"port": port_proto, "service": service, "version": version}
+                    open_ports.append(entry)
+                    print(f"    {port_proto:20} {service:15} {version}")
+            if not open_ports:
+                print("    No open ports found in top 1000")
+        else:
+            print(f"[-] nmap error: {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        print("[-] nmap timed out after 120s")
+    except FileNotFoundError:
+        print("[-] nmap not found, skipping")
+    return open_ports
+
+
+# ── Module 3: HackerOne Public Report Scraper ────────────────────────────────
+def scrape_hackerone(keyword, max_results=5):
+    print(f"\n[*] Searching HackerOne public reports for: {keyword}")
+    writeups = []
+    try:
+        url = f"https://hackerone.com/hacktivity?querystring={keyword}"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # HackerOne's hacktivity page is JS-rendered so we fall back to their
+        # public GraphQL API for disclosed reports
+        api_url = "https://hackerone.com/graphql"
+        query = """
+        {
+          search(query: "%s", product_area: "hacktivity", first: %d) {
+            nodes {
+              ... on HacktivityDocument {
+                report {
+                  title
+                  vulnerability_information
+                  severity_rating
+                  disclosed_at
+                }
+              }
+            }
+          }
+        }
+        """ % (keyword, max_results)
+
+        resp = requests.post(
+            api_url,
+            json={"query": query},
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=15
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            nodes = data.get("data", {}).get("search", {}).get("nodes", [])
+            for node in nodes:
+                report = node.get("report")
+                if report and report.get("title"):
+                    writeups.append({
+                        "title": report["title"],
+                        "content": f"Severity: {report.get('severity_rating', 'unknown')}\n{report.get('vulnerability_information', '')[:500]}"
+                    })
+                    print(f"    [+] {report['title'][:80]}")
+
+        # Fallback: scrape public writeup repos via GitHub search API
+        if not writeups:
+            print("    [*] H1 API returned no results, trying GitHub writeup repos...")
+            gh_url = f"https://api.github.com/search/repositories?q={keyword}+bugbounty+writeup&sort=stars&per_page=3"
+            gh_resp = requests.get(gh_url, headers=HEADERS, timeout=10)
+            if gh_resp.status_code == 200:
+                repos = gh_resp.json().get("items", [])
+                for repo in repos:
+                    writeups.append({
+                        "title": repo["full_name"],
+                        "content": repo.get("description", "") or ""
+                    })
+                    print(f"    [+] GitHub: {repo['full_name']}")
+
     except Exception as e:
-        print(f"  ❌ Failed to fetch {url}: {e}")
-        return None
+        print(f"    [-] Scraper error: {e}")
+
+    return writeups
 
 
+# ── Header Analysis ───────────────────────────────────────────────────────────
 def analyze_headers(response):
-    print("\n📡 Response Headers Analysis:")
-    interesting = {}
-    security_headers = {
-        "Content-Security-Policy": "CSP",
-        "X-Frame-Options": "Clickjacking protection",
-        "X-Content-Type-Options": "MIME sniffing protection",
-        "Strict-Transport-Security": "HSTS",
-        "X-XSS-Protection": "XSS filter",
-        "Access-Control-Allow-Origin": "CORS policy",
-    }
-
+    print("\n[*] Analyzing headers...")
     findings = []
     headers = {k.lower(): v for k, v in response.headers.items()}
 
-    # Tech fingerprint
     for h in ["server", "x-powered-by", "x-aspnet-version", "x-generator"]:
         if h in headers:
-            val = headers[h]
-            interesting[h] = val
-            findings.append(f"Tech fingerprint: {h} = {val}")
-            print(f"  🖥️  {h}: {val}")
+            findings.append(f"Tech fingerprint: {h} = {headers[h]}")
+            print(f"    tech: {h} = {headers[h]}")
 
-    # Missing security headers
     missing = []
-    for header, desc in security_headers.items():
-        if header.lower() not in headers:
-            missing.append(f"{header} ({desc})")
+    for h in ["content-security-policy", "x-frame-options", "strict-transport-security",
+              "x-content-type-options", "x-xss-protection"]:
+        if h not in headers:
+            missing.append(h)
 
     if missing:
         findings.append(f"Missing security headers: {', '.join(missing)}")
-        for m in missing:
-            print(f"  ⚠️  Missing: {m}")
-    else:
-        print("  ✅ All major security headers present")
+        print(f"    missing headers: {', '.join(missing)}")
 
-    # CORS check
-    if "access-control-allow-origin" in headers:
-        val = headers["access-control-allow-origin"]
-        if val == "*":
-            findings.append("CORS misconfiguration: Access-Control-Allow-Origin: * (wildcard)")
-            print(f"  🚨 CORS wildcard detected!")
+    if headers.get("access-control-allow-origin") == "*":
+        findings.append("CORS misconfiguration: wildcard Access-Control-Allow-Origin")
+        print("    CORS wildcard detected")
 
     return findings
 
 
+# ── JS Analysis ───────────────────────────────────────────────────────────────
+def fetch_page(url):
+    try:
+        return requests.get(url, headers=HEADERS, timeout=10, verify=False)
+    except:
+        return None
+
+
 def find_js_files(url, soup):
-    print("\n🔍 Finding JavaScript files...")
+    print("\n[*] Finding JS files...")
     js_files = []
     base = "{0.scheme}://{0.netloc}".format(urlparse(url))
-
     for tag in soup.find_all("script", src=True):
         src = tag["src"]
         if src.startswith("http"):
@@ -218,15 +343,11 @@ def find_js_files(url, soup):
             js_files.append("https:" + src)
         else:
             js_files.append(urljoin(base, src))
-
-    print(f"  Found {len(js_files)} JS files")
-    for f in js_files:
-        print(f"  📄 {f}")
+    print(f"    found {len(js_files)} JS files")
     return js_files
 
 
 def check_lib_version(lib_name, version_str):
-    """Compare version string against known vuln versions"""
     findings = []
     try:
         parts = [int(x) for x in re.split(r"[.\-]", version_str)[:3]]
@@ -235,192 +356,185 @@ def check_lib_version(lib_name, version_str):
         version_tuple = tuple(parts)
     except:
         return findings
-
     if lib_name.lower() in VULN_LIBS:
         for vuln in VULN_LIBS[lib_name.lower()]:
             try:
                 threshold = tuple(int(x) for x in vuln["below"].split(".")[:3])
                 if version_tuple < threshold:
                     findings.append(
-                        f"VULNERABLE: {lib_name} {version_str} < {vuln['below']} — "
-                        f"{vuln['cve']}: {vuln['desc']}"
+                        f"VULNERABLE: {lib_name} {version_str} < {vuln['below']} — {vuln['cve']}: {vuln['desc']}"
                     )
             except:
                 continue
     return findings
 
 
-def analyze_js_content(js_url, content):
-    findings = {
-        "secrets": [],
-        "endpoints": [],
-        "vuln_libs": [],
-    }
-
-    # Secret hunting
-    for name, pattern in SECRET_PATTERNS.items():
-        matches = re.findall(pattern, content)
-        if matches:
-            # Deduplicate and truncate for display
-            unique = list(set(matches))[:3]
-            for m in unique:
-                display = m[:80] + "..." if len(m) > 80 else m
-                findings["secrets"].append(f"{name}: {display}")
-
-    # Library version detection
-    lib_patterns = {
-        "jquery":    r"(?i)jquery[^\d]*(\d+\.\d+[\.\d]*)",
-        "angular":   r"(?i)angular[^\d]*(\d+\.\d+[\.\d]*)",
-        "lodash":    r"(?i)lodash[^\d]*(\d+\.\d+[\.\d]*)",
-        "bootstrap": r"(?i)bootstrap[^\d]*(\d+\.\d+[\.\d]*)",
-        "moment":    r"(?i)moment[^\d]*(\d+\.\d+[\.\d]*)",
-        "react":     r"(?i)react[^\d]*(\d+\.\d+[\.\d]*)",
-    }
-
-    for lib, pattern in lib_patterns.items():
-        matches = re.findall(pattern, content)
-        if matches:
-            version = matches[0]
-            vuln_findings = check_lib_version(lib, version)
-            if vuln_findings:
-                for f in vuln_findings:
-                    findings["vuln_libs"].append(f)
-            else:
-                findings["vuln_libs"].append(f"{lib} {version} (no known CVEs)")
-
-    return findings
-
-
-def analyze_all_js(js_files):
-    print("\n🧪 Analyzing JavaScript files...")
-    all_findings = {"secrets": [], "endpoints": [], "vuln_libs": []}
-
-    for js_url in js_files[:10]:  # Cap at 10 files
-        print(f"  ⏳ Fetching {js_url[:80]}...")
+def analyze_js_files(js_files):
+    print("\n[*] Analyzing JS files...")
+    all_findings = {"secrets": [], "vuln_libs": []}
+    for js_url in js_files[:10]:
         r = fetch_page(js_url)
         if not r:
             continue
+        for name, pattern in SECRET_PATTERNS.items():
+            matches = re.findall(pattern, r.text)
+            if matches:
+                display = list(set(matches))[0][:80]
+                all_findings["secrets"].append(f"{name}: {display}")
+                print(f"    [!] {name} in {js_url.split('/')[-1]}")
 
-        findings = analyze_js_content(js_url, r.text)
-
-        if findings["secrets"]:
-            print(f"  🚨 Potential secrets found in {js_url.split('/')[-1]}:")
-            for s in findings["secrets"]:
-                print(f"     → {s}")
-            all_findings["secrets"].extend(findings["secrets"])
-
-        if findings["vuln_libs"]:
-            for v in findings["vuln_libs"]:
-                print(f"  {'🚨' if 'VULNERABLE' in v else '📦'} {v}")
-            all_findings["vuln_libs"].extend(findings["vuln_libs"])
+        lib_patterns = {
+            "jquery": r"(?i)jquery[^\d]*(\d+\.\d+[\.\d]*)",
+            "angular": r"(?i)angular[^\d]*(\d+\.\d+[\.\d]*)",
+            "lodash": r"(?i)lodash[^\d]*(\d+\.\d+[\.\d]*)",
+            "bootstrap": r"(?i)bootstrap[^\d]*(\d+\.\d+[\.\d]*)",
+            "moment": r"(?i)moment[^\d]*(\d+\.\d+[\.\d]*)",
+            "react": r"(?i)react[^\d]*(\d+\.\d+[\.\d]*)",
+        }
+        for lib, pattern in lib_patterns.items():
+            matches = re.findall(pattern, r.text)
+            if matches:
+                vulns = check_lib_version(lib, matches[0])
+                for v in vulns:
+                    all_findings["vuln_libs"].append(v)
+                    print(f"    [!] {v}")
 
     if not all_findings["secrets"] and not all_findings["vuln_libs"]:
-        print("  ✅ No obvious secrets or vulnerable libraries found")
-
+        print("    nothing suspicious found")
     return all_findings
 
 
-# ── RAG query with recon context ──────────────────────────────────────────────
-def query_with_recon(target_url, recon_summary, embedder, qdrant_client):
-    print("\n🤖 Querying RAG with recon context...")
+# ── RAG query ─────────────────────────────────────────────────────────────────
+def query_rag(target, recon_summary, embedder, qdrant_client, extra_writeups=None):
+    print("\n[*] Querying RAG pipeline...")
 
-    # Build a semantic query from recon findings
-    query_text = f"attack paths for: {recon_summary}"
-    query_vector = embedder.encode(query_text).tolist()
+    # Dynamically add any scraped writeups
+    if extra_writeups:
+        existing_count = len(WRITEUPS)
+        new_points = []
+        for i, w in enumerate(extra_writeups):
+            text = f"{w['title']}\n{w['content']}"
+            vector = embedder.encode(text).tolist()
+            new_points.append(PointStruct(id=existing_count + i, vector=vector, payload=w))
+        if new_points:
+            qdrant_client.upsert(collection_name=COLLECTION_NAME, points=new_points)
+            print(f"[+] Added {len(new_points)} live writeups to knowledge base")
 
+    query_vector = embedder.encode(recon_summary).tolist()
     results = qdrant_client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
-        limit=4,
+        limit=5,
     ).points
 
-    print(f"📎 Retrieved {len(results)} relevant writeups:")
+    print(f"[+] Retrieved {len(results)} relevant writeups:")
     context = ""
     for r in results:
-        print(f"  - {r.payload['title']} (score: {r.score:.2f})")
+        print(f"    {r.payload['title']} (score: {r.score:.2f})")
         context += f"\nWriteup: {r.payload['title']}\n{r.payload['content']}\n"
 
-    prompt = f"""You are an expert penetration tester. You have just performed recon on a target.
+    prompt = f"""You are an expert penetration tester. You have just completed recon on a target.
 
-TARGET: {target_url}
+TARGET: {target}
 
 RECON FINDINGS:
 {recon_summary}
 
-RELEVANT BUG BOUNTY WRITEUPS FOR CONTEXT:
+RELEVANT BUG BOUNTY WRITEUPS:
 {context}
 
 Based on the recon findings and similar past vulnerabilities, provide:
 1. TOP 5 attack paths to investigate (most promising first)
-2. For each: specific steps to test it on THIS target
-3. Tools to use for each attack path
+2. For each: specific steps to test on THIS target
+3. Tools to use
 4. What a successful exploit would look like
 
 Be specific and actionable. Focus on what the recon actually revealed.
 """
 
     print("\n" + "=" * 60)
-    print("🎯 ATTACK PATH RECOMMENDATIONS")
+    print("ATTACK PATH RECOMMENDATIONS")
     print("=" * 60)
-
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    response = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
     print(response["message"]["content"])
     print("=" * 60)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
     embedder, qdrant_client = setup_rag()
 
     print("=" * 60)
-    print("🎯 OFFENSIVE RECON RAG")
+    print("vulnrag v2.0")
     print("=" * 60)
 
     target = input("\nEnter target URL (e.g. https://example.com): ").strip()
     if not target.startswith("http"):
         target = "https://" + target
 
-    print(f"\n🌐 Fetching {target}...")
+    parsed = urlparse(target)
+    domain = parsed.netloc or parsed.path
+
+    # ── Run all recon modules ─────────────────────────────────────────────────
+    print(f"\n[*] Starting recon on {target}")
+
+    # 1. Page fetch + header analysis + JS
+    print(f"\n[*] Fetching {target}...")
     response = fetch_page(target)
-    if not response:
-        print("❌ Could not reach target. Exiting.")
-        sys.exit(1)
+    header_findings = []
+    js_findings = {"secrets": [], "vuln_libs": []}
 
-    print(f"  ✅ Status: {response.status_code}")
-    soup = BeautifulSoup(response.text, "html.parser")
+    if response:
+        print(f"[+] Status: {response.status_code}")
+        soup = BeautifulSoup(response.text, "html.parser")
+        header_findings = analyze_headers(response)
+        js_files = find_js_files(target, soup)
+        js_findings = analyze_js_files(js_files)
+    else:
+        print("[-] Could not reach target")
 
-    # Run recon modules
-    header_findings = analyze_headers(response)
-    js_files        = find_js_files(target, soup)
-    js_findings     = analyze_all_js(js_files)
+    # 2. Subdomain enumeration
+    subdomains = enumerate_subdomains(domain)
 
-    # Build recon summary for RAG
-    recon_parts = []
+    # 3. Port scan on main domain
+    open_ports = scan_ports(domain)
+
+    # 4. Scrape live HackerOne writeups based on tech fingerprint
+    tech_keyword = "web application"
+    for f in header_findings:
+        if "x-powered-by" in f.lower() or "server" in f.lower():
+            tech_keyword = f.split("=")[-1].strip().split("/")[0]
+            break
+    live_writeups = scrape_hackerone(tech_keyword)
+
+    # ── Build recon summary ───────────────────────────────────────────────────
+    parts = []
 
     if header_findings:
-        recon_parts.append("Header findings:\n" + "\n".join(f"- {f}" for f in header_findings))
+        parts.append("Header findings:\n" + "\n".join(f"- {x}" for x in header_findings))
 
     if js_findings["secrets"]:
-        recon_parts.append("Potential secrets in JS:\n" + "\n".join(f"- {s}" for s in js_findings["secrets"]))
+        parts.append("Potential secrets in JS:\n" + "\n".join(f"- {x}" for x in js_findings["secrets"]))
 
     if js_findings["vuln_libs"]:
-        vuln_only = [v for v in js_findings["vuln_libs"] if "VULNERABLE" in v]
-        if vuln_only:
-            recon_parts.append("Vulnerable JS libraries:\n" + "\n".join(f"- {v}" for v in vuln_only))
+        vulns = [v for v in js_findings["vuln_libs"] if "VULNERABLE" in v]
+        if vulns:
+            parts.append("Vulnerable JS libraries:\n" + "\n".join(f"- {v}" for v in vulns))
 
-    recon_summary = "\n\n".join(recon_parts) if recon_parts else "No major findings from automated recon."
+    if subdomains:
+        parts.append(f"Subdomains found ({len(subdomains)} total):\n" + "\n".join(f"- {s}" for s in subdomains[:10]))
 
-    # Query RAG with findings
-    query_with_recon(target, recon_summary, embedder, qdrant_client)
+    if open_ports:
+        port_lines = [f"- {p['port']} {p['service']} {p['version']}" for p in open_ports]
+        parts.append("Open ports:\n" + "\n".join(port_lines))
 
-    # Interactive follow-up
-    print("\n💬 Ask follow-up questions about this target (or 'quit' to exit):")
+    recon_summary = "\n\n".join(parts) if parts else "No significant findings from automated recon."
+
+    # ── RAG query ─────────────────────────────────────────────────────────────
+    query_rag(target, recon_summary, embedder, qdrant_client, extra_writeups=live_writeups)
+
+    # ── Interactive follow-up ─────────────────────────────────────────────────
+    print("\nAsk follow-up questions about this target (or 'quit' to exit):")
     while True:
         q = input("\nQuery > ").strip()
         if q.lower() in ("quit", "exit", "q"):
@@ -433,10 +547,8 @@ def main():
                 query=query_vector,
                 limit=3,
             ).points
-            context = "\n".join(
-                f"Writeup: {r.payload['title']}\n{r.payload['content']}" for r in results
-            )
-            prompt = f"Target: {target}\nRecon context: {recon_summary}\nRelevant writeups: {context}\nQuestion: {q}\nAnswer as a pentester:"
+            context = "\n".join(f"Writeup: {r.payload['title']}\n{r.payload['content']}" for r in results)
+            prompt = f"Target: {target}\nRecon: {recon_summary}\nRelevant writeups: {context}\nQuestion: {q}\nAnswer as a pentester:"
             resp = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
             print("\n" + resp["message"]["content"])
 
