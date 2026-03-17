@@ -1,6 +1,6 @@
 # vulnrag
 
-An AI-powered recon and attack surface analysis tool built on a RAG pipeline. Point it at a target, it does the legwork — fingerprints the stack, hunts for secrets in JS, flags vulnerable libraries, then uses a local LLM to suggest attack paths based on real bug bounty writeups.
+An AI-powered recon and attack surface analysis tool built on a RAG pipeline. Point it at a target, it does the legwork; fingerprints the stack, hunts for secrets in JS, flags vulnerable libraries, then uses a local LLM to suggest attack paths based on real bug bounty writeups.
 
 No API keys. Runs fully local.
 
