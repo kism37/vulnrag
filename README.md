@@ -11,7 +11,7 @@ Runs fully local. No API keys required.
 ## What it does
 
 **Recon:**
-- Response header analysis — tech fingerprinting, missing security headers, CORS misconfigs
+- Response header analysis: tech fingerprinting, missing security headers, CORS misconfigs
 - Finds and fetches all JS files, scans for hardcoded secrets, API keys, JWTs, S3 buckets, internal URLs
 - Detects JS library versions and matches against known CVEs (jQuery, React, lodash, Angular, Bootstrap, moment.js)
 - Subdomain enumeration via subfinder + certificate transparency (crt.sh)
@@ -36,11 +36,11 @@ Runs fully local. No API keys required.
 - HackerOne public disclosed reports
 - ExploitDB web exploits
 - NVD/CVE feeds (last 30 days, high/critical only)
-- Security blogs — PortSwigger, ProjectDiscovery, Assetnote, HackTricks
+- Security blogs: PortSwigger, ProjectDiscovery, Assetnote, HackTricks
 - GitHub Security Advisories
 - OWASP Top 10 and Cheat Sheet Series
 
-At every stage the LLM pulls relevant docs from the knowledge base and gives target-specific guidance — not generic advice.
+At every stage the LLM pulls relevant docs from the knowledge base and gives target-specific guidance, not generic advice.
 
 ---
 
@@ -131,7 +131,7 @@ Set up a weekly cron to keep it fresh:
 ## Project structure
 
 ```
-vulnrag/
+ragent/
   engine/
     embedder.py       embedding model (singleton)
     retriever.py      persistent Qdrant vectorstore
